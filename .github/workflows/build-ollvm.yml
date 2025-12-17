@@ -1,4 +1,4 @@
-name: Build OLLVM Android (Termux)
+name: Build OLLVM Android (Termux) - Stable
 
 on:
   workflow_dispatch:
@@ -14,6 +14,23 @@ jobs:
     runs-on: ubuntu-24.04
     
     steps:
+      - name: Free Disk Space & Create Swap
+        run: |
+          # 1. 清理预装软件释放磁盘空间 (为 Swap 腾位置)
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache/CodeQL
+          
+          # 2. 创建 10GB 的 Swap 文件
+          sudo fallocate -l 10G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          
+          # 3. 检查内存状态
+          free -h
+
       - name: Checkout OLLVM Source
         uses: actions/checkout@v4
         with:
@@ -31,38 +48,33 @@ jobs:
         id: setup-ndk
         run: |
           echo "Downloading NDK ${{ inputs.ndk_version }}..."
-          # 下载官方 NDK
           curl -sSfL -o android-ndk.zip "https://dl.google.com/android/repository/android-ndk-${{ inputs.ndk_version }}-linux.zip"
           unzip -qq android-ndk.zip
           
-          # 设置环境变量
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "ANDROID_NDK_HOME=$NDK_ROOT" >> $GITHUB_ENV
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
           
-          # 获取 Toolchain 路径供后续 strip 使用
           TOOLCHAIN_BIN=$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin
           echo "TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> $GITHUB_ENV
 
-      - name: Configure CMake (Cross-Compile)
+      - name: Configure CMake (Memory Optimized)
         run: |
           mkdir -p build
           
-          # 关键配置说明:
-          # - DCMAKE_TOOLCHAIN_FILE: 使用 NDK 自带的 cmake 工具链
-          # - DANDROID_ABI=arm64-v8a: 目标架构为 64位安卓 (Termux)
-          # - DANDROID_PLATFORM=28: 最低支持 Android 9 (也可设为 24)
-          # - DANDROID_STL=c++_static: 静态链接 libc++，方便在 Termux 直接运行
-          # - DLLVM_HOST_TRIPLE: 告诉 LLVM 生成的 clang 默认目标是安卓
+          # 修改点: 
+          # 1. MinSizeRel: 省内存且体积小
+          # 2. LLVM_PARALLEL_LINK_JOBS=1: 强制单线程链接，防止崩在最后一步
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-28 \
             -DANDROID_STL=c++_static \
-            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_BUILD_TYPE=MinSizeRel \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -74,34 +86,23 @@ jobs:
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
             -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
 
-      - name: Build LLVM (Ninja)
+      - name: Build LLVM (Restricted Parallelism)
         run: |
-          # 使用所有核心并行编译
-          cmake --build build --target install --parallel $(nproc)
+          # 强制使用 -j2 (2个线程)。
+          # 虽然 Github Runner 是2核，但开满由于IO等待通常能跑更快，
+          # 可是为了省内存，必须限制在2甚至1。
+          cmake --build build --target install --parallel 2
 
-      - name: Strip Binaries (Reduce Size)
+      - name: Strip Binaries
         run: |
-          echo "Stripping binaries to save space..."
-          # 使用 NDK 自带的 llvm-strip
           STRIP_TOOL=${{ env.TOOLCHAIN_BIN }}/llvm-strip
-          
-          # 遍历安装目录下的 bin 文件夹进行 strip
           find install_output/bin -type f -exec file {} \; | grep "ELF 64-bit" | cut -d: -f1 | xargs -r $STRIP_TOOL --strip-all || true
-          
-          # 验证生成的文件
-          ls -lh install_output/bin/clang
-          file install_output/bin/clang
 
       - name: Pack and Split Artifacts
         run: |
           cd install_output
-          # 使用 7z 压缩并分割，每卷 450MB (GitHub 限制 500MB 比较极限，450 比较稳)
-          # -v450m: 分卷大小
-          # -mx=9: 最大压缩率
           7z a -t7z -mx=9 -v450m ../ollvm-aarch64-android.7z .
           cd ..
-          
-          echo "Generated Artifacts:"
           ls -lh ollvm-aarch64-android.7z*
 
       - name: Upload Artifacts
@@ -111,7 +112,7 @@ jobs:
           path: ollvm-aarch64-android.7z*
           retention-days: 5
 
-      - name: Create Release (Optional)
+      - name: Create Release
         uses: ncipollo/release-action@v1.14.0
         with:
           name: "OLLVM Android Build ${{ inputs.ndk_version }}"
@@ -121,12 +122,5 @@ jobs:
           replacesArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            Build for aarch64-linux-android (Termux).
+            Optimized build for Termux (MinSizeRel).
             Source: lux-QAQ/ollvm-clang21.0
-            NDK: ${{ inputs.ndk_version }}
-            
-            **How to install in Termux:**
-            1. Download all `.7z.001`, `.002` etc.
-            2. Install p7zip: `pkg install p7zip`
-            3. Extract: `7z x ollvm-aarch64-android.7z.001`
-            4. Copy binaries from `bin/` to your path or replace existing clang.
