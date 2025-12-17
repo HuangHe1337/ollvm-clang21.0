@@ -1,10 +1,10 @@
-name: Build OLLVM Android (Termux) - Stable
+name: Build OLLVM Android (Termux) - Bulletproof
 
 on:
   workflow_dispatch:
     inputs:
       ndk_version:
-        description: "Android NDK Version (e.g., r27c)"
+        description: "Android NDK Version"
         default: 'r27c'
         required: true
 
@@ -14,21 +14,32 @@ jobs:
     runs-on: ubuntu-24.04
     
     steps:
-      - name: Free Disk Space & Create Swap
+      - name: Free Disk Space (Aggressive)
         run: |
-          # 1. 清理预装软件释放磁盘空间 (为 Swap 腾位置)
+          echo "Cleaning up disk space..."
+          # 删除大量预装软件，腾出空间给 Swap
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
-          
-          # 2. 创建 10GB 的 Swap 文件
-          sudo fallocate -l 10G /swapfile
+          sudo docker image prune --all --force
+          echo "Disk space after cleanup:"
+          df -h
+
+      - name: Create Massive Swap (20GB)
+        run: |
+          echo "Creating 20GB Swap file..."
+          # 创建 20GB 的 Swap
+          sudo fallocate -l 20G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
           
-          # 3. 检查内存状态
+          # 关键优化: 设置 swappiness 为 100
+          # 告诉内核："只要物理内存有一点压力，就拼命用 Swap，千万别杀我的进程！"
+          sudo sysctl vm.swappiness=100
+          
+          echo "Memory Status:"
           free -h
 
       - name: Checkout OLLVM Source
@@ -58,23 +69,26 @@ jobs:
           TOOLCHAIN_BIN=$NDK_ROOT/toolchains/llvm/prebuilt/linux-x86_64/bin
           echo "TOOLCHAIN_BIN=$TOOLCHAIN_BIN" >> $GITHUB_ENV
 
-      - name: Configure CMake (Memory Optimized)
+      - name: Configure CMake (Safe Mode)
         run: |
           mkdir -p build
           
-          # 修改点: 
-          # 1. MinSizeRel: 省内存且体积小
-          # 2. LLVM_PARALLEL_LINK_JOBS=1: 强制单线程链接，防止崩在最后一步
-          
+          # 这里的配置是为了绝对的稳定性
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-28 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=MinSizeRel \
+            -DCMAKE_C_FLAGS="-g0 -O3" \
+            -DCMAKE_CXX_FLAGS="-g0 -O3" \
+            -DCMAKE_ASM_FLAGS="-g0" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_ENABLE_LTO=OFF \
+            -DLLVM_ENABLE_BACKTRACES=OFF \
+            -DLLVM_ENABLE_PLUGINS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -86,22 +100,25 @@ jobs:
             -DLLVM_HOST_TRIPLE=aarch64-linux-android \
             -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
 
-      - name: Build LLVM (Restricted Parallelism)
+      - name: Build LLVM (Safe Parallelism)
         run: |
-          # 强制使用 -j2 (2个线程)。
-          # 虽然 Github Runner 是2核，但开满由于IO等待通常能跑更快，
-          # 可是为了省内存，必须限制在2甚至1。
+          echo "Starting build with 2 cores + 20GB Swap..."
+          # 保持 2 线程。有了 20GB Swap，2 线程是绝对安全的。
+          # 如果这里改成 1 线程，时间会超过 GitHub 的 6 小时限制，所以必须用 2。
           cmake --build build --target install --parallel 2
 
       - name: Strip Binaries
         run: |
           STRIP_TOOL=${{ env.TOOLCHAIN_BIN }}/llvm-strip
+          echo "Stripping binaries..."
           find install_output/bin -type f -exec file {} \; | grep "ELF 64-bit" | cut -d: -f1 | xargs -r $STRIP_TOOL --strip-all || true
 
       - name: Pack and Split Artifacts
         run: |
           cd install_output
-          7z a -t7z -mx=9 -v450m ../ollvm-aarch64-android.7z .
+          # 降低压缩内存消耗 (mx=7)
+          echo "Compressing..."
+          7z a -t7z -mx=7 -v450m ../ollvm-aarch64-android.7z .
           cd ..
           ls -lh ollvm-aarch64-android.7z*
 
@@ -122,5 +139,6 @@ jobs:
           replacesArtifacts: true
           token: ${{ secrets.GITHUB_TOKEN }}
           body: |
-            Optimized build for Termux (MinSizeRel).
+            Bulletproof build for Termux.
+            Config: MinSizeRel, NoDebug (-g0), NoLTO.
             Source: lux-QAQ/ollvm-clang21.0
