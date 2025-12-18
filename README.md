@@ -6,7 +6,7 @@
 
 
 
-# 移植 ollvm(Hikari) 到 llvm+clang21.0
+# 使用Github Action 解放双手构建Ollvm(Hikari) LLVM21
 
 将 [ollvm-clang21](https://github.com/Accelerator6869/ollvm-clang21.0) 使用Github Action构建Aarch64 Android供Termux用
 
