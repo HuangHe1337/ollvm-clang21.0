@@ -8,7 +8,7 @@
 
 # 移植 ollvm(Hikari) 到 llvm+clang21.0
 
-将 [ollvm-clang21](https://github.com/Accelerator6869/ollvm-clang21.0) ~~移植~~ 使用Github Action构建Aarch64 Android供Termux用
+将 [ollvm-clang21](https://github.com/Accelerator6869/ollvm-clang21.0) 使用Github Action构建Aarch64 Android供Termux用
 
 感谢 [Android-NDK-Custom](https://github.com/HomuHomu833/android-ndk-custom) 的Github Action构建思路 [灵感来源](https://github.com/HomuHomu833/android-ndk-custom/blob/main/.github/workflows/make_ndk_bionic.yml)
 
