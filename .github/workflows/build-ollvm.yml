@@ -89,12 +89,6 @@ jobs:
         run: |
           cmake --build build --target install --parallel 2
 
-      - name: Strip Binaries
-        run: |
-          STRIP_TOOL=${{ env.TOOLCHAIN_BIN }}/llvm-strip
-          echo "Stripping binaries..."
-          find install_output/bin -type f -exec file {} \; | grep "ELF 64-bit" | cut -d: -f1 | xargs -r $STRIP_TOOL --strip-all || true
-
       - name: Pack and Split Artifacts (Tar+XZ)
         run: |
           cd install_output
