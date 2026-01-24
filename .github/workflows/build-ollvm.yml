@@ -1,4 +1,4 @@
-name: Build OLLVM Android (Termux) - Fix Symbols & Split 400M
+name: Build OLLVM Android (Termux) - Fix CMake Conflict
 
 on:
   workflow_dispatch:
@@ -56,14 +56,18 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_ROOT" >> $GITHUB_ENV
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Fix Symbols & Plugins)
+      - name: Configure CMake (Conflict Fixed)
         run: |
           mkdir -p build
           
-          # 关键参数解释:
-          # LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON : 导出主程序符号，解决 dlopen 报错
-          # CMAKE_INSTALL_DO_STRIP=OFF         : 禁止安装时剥离符号
-          # LLVM_BUILD_LLVM_DYLIB=ON           : 编译 libLLVM.so 动态库
+          # === 修复说明 ===
+          # LLVM_LINK_LLVM_DYLIB=OFF (必须关闭): 
+          #   因为开启它会导致与 LLVM_EXPORT_SYMBOLS_FOR_PLUGINS 冲突。
+          #   我们选择静态链接模式。
+          #
+          # LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON (关键):
+          #   即使是静态链接，也强制 clang 导出符号，
+          #   这样你的 libSkeletonPass.so 就能找到 "_ZN4llvm..." 这些符号了。
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -80,24 +84,24 @@ jobs:
             \
             -DLLVM_ENABLE_PLUGINS=ON \
             -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
             -DCMAKE_INSTALL_DO_STRIP=OFF \
             \
             -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
 
       - name: Build OLLVM
         run: |
-          # 编译并安装到 install_output 目录
+          # 编译并安装
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup & Prepare Artifacts
         run: |
           cd install_output
           
-          # 可选：删除静态库(.a)以减小体积，但保留 .so 和 可执行文件
-          # 强烈建议保留 libLLVM.so，因为插件可能依赖它
-          # rm -rf lib/*.a 
+          # 清理静态库，因为我们现在是静态链接的 clang，
+          # lib/ 目录下的 .a 文件通常不再需要保留给最终用户。
+          rm -rf lib/*.a 
           
           echo "Size before compression:"
           du -sh .
