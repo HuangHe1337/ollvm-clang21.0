@@ -1,4 +1,4 @@
-name: Build OLLVM (Clang & LLD Only) - Termux
+name: Build OLLVM (Static + Release) - Termux Ready
 
 on:
   workflow_dispatch:
@@ -8,9 +8,12 @@ on:
         default: 'r27c'
         required: true
 
+permissions:
+  contents: write  # 必须开启，否则无法上传 Release
+
 jobs:
   build:
-    name: Build Clang+LLD
+    name: Build Clang/LLD (Static)
     runs-on: ubuntu-24.04
     
     steps:
@@ -24,14 +27,12 @@ jobs:
 
       - name: Setup Swap (16GB)
         run: |
-          # 重置 Swap 防止 Text file busy
           sudo swapoff -a || true
           sudo rm -f /swapfile
           sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          free -h
 
       - name: Checkout Source
         uses: actions/checkout@v4
@@ -53,22 +54,21 @@ jobs:
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Clang & LLD Only)
+      - name: Configure CMake (Static & Plugin Support)
         run: |
           mkdir -p build
           
-          # === 配置详解 ===
-          # 1. LLVM_ENABLE_PROJECTS="clang;lld" : 只开启 Clang 和 LLD
-          # 2. LLVM_BUILD_TOOLS=OFF             : 不构建 llvm-objdump/bugpoint 等杂项 (解决报错的关键)
-          # 3. LLVM_INCLUDE_UTILS=OFF           : 不构建辅助工具
-          # 4. LLVM_EXPORT_SYMBOLS...=ON        : 强制导出符号 (解决 dlopen 报错)
-          # 5. LLVM_PARALLEL_LINK_JOBS=1        : 防止内存溢出
+          # === 关键修复 ===
+          # 1. ANDROID_STL=c++_static          : 静态链接 libc++，解决 "libc++_shared.so not found"
+          # 2. LLVM_STATIC_LINK_CXX_STDLIB=ON  : 再次强制 LLVM 使用静态 C++ 库
+          # 3. LLVM_BUILD_TOOLS=OFF            : 不编译杂项工具，只编译 clang/lld
+          # 4. LLVM_EXPORT_SYMBOLS...=ON       : 即使静态链接，也导出符号供 Pass 插件使用
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-29 \
-            -DANDROID_STL=c++_shared \
+            -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
@@ -82,6 +82,7 @@ jobs:
             -DLLVM_ENABLE_LTO=OFF \
             \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
+            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLLVM_ENABLE_PLUGINS=ON \
             -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
@@ -92,27 +93,45 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 仅编译安装配置好的组件 (Clang + LLD)
+          # 开始编译
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup Artifacts
         run: |
           cd install_output
-          # 删除静态库 (.a) 减小体积，只保留二进制和 .so
+          # 删除静态库 (.a) 减小体积 (Termux用户不需要这些去二次开发LLVM)
           rm -rf lib/*.a 
           
-          echo "Final Size:"
+          echo "Build finished. Final size:"
           du -sh .
 
       - name: Compress and Split
         run: |
-          # xz 极限压缩 + 400MB 分卷
-          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-bindist.tar.xz."
-          ls -lh ollvm-bindist.tar.xz.*
+          # 打包 -> xz压缩 -> 分割(400M)
+          # 文件名: ollvm-android.tar.xz.aa, ollvm-android.tar.xz.ab ...
+          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-android.tar.xz."
+          
+          ls -lh ollvm-android.tar.xz.*
 
-      - name: Upload Artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        if: success()
         with:
-          name: ollvm-android-arm64-parts
-          path: ollvm-bindist.tar.xz.*
-          retention-days: 5
+          tag_name: ollvm-build-${{ github.run_number }}
+          name: OLLVM Build ${{ github.run_number }} (Termux/Android)
+          body: |
+            Build of OLLVM for Android (AArch64).
+            
+            **Configuration:**
+            - NDK: ${{ inputs.ndk_version }}
+            - Projects: Clang, LLD
+            - Linking: Static (libc++_static), No dependency on libc++_shared.so
+            - Plugin Support: Enabled (Exported Symbols)
+            
+            **How to use:**
+            Download all parts and run:
+            `cat ollvm-android.tar.xz.* | tar -xJ`
+          files: |
+            ollvm-android.tar.xz.*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
