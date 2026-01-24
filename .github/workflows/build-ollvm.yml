@@ -1,4 +1,4 @@
-name: Build OLLVM Android (Termux) - Fix Bus Error
+name: Build OLLVM Android (Termux) - Final Fix
 
 on:
   workflow_dispatch:
@@ -16,22 +16,30 @@ jobs:
     steps:
       - name: Free Disk Space (Aggressive)
         run: |
-          # 清理空间：移除 .NET, Android SDKs, CodeQL 等不必要组件
+          # 清理空间
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
-      - name: Create Swap (16GB)
+      - name: Recreate Swap (16GB)
         run: |
-          # 16GB Swap 平衡内存需求和磁盘空间
-          # 如果 Swap 太大(20G+)，可能会挤占磁盘导致 Bus Error (Disk Full)
+          # === 修复 Text file busy 错误 ===
+          # 1. 先关闭所有现有的 Swap (防止文件被占用)
+          sudo swapoff -a || true
+          
+          # 2. 删除旧的 swapfile (如果存在)
+          sudo rm -f /swapfile
+          
+          # 3. 创建新的 16GB Swap
           sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          sudo sysctl vm.swappiness=100
+          
+          # 4. 验证 Swap 状态
+          free -h
 
       - name: Checkout OLLVM Source
         uses: actions/checkout@v4
@@ -57,20 +65,18 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_ROOT" >> $GITHUB_ENV
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Memory Safe)
+      - name: Configure CMake (Memory Safe & Symbols Fixed)
         run: |
           mkdir -p build
           
-          # === 关键修复说明 ===
-          # 1. LLVM_PARALLEL_LINK_JOBS=1 : 
-          #    最重要的一行！强制一次只链接一个文件。
-          #    防止 clang 和 llvm-objdump 同时链接导致内存爆炸。
+          # === 配置说明 ===
+          # 1. 内存控制:
+          #    - LLVM_PARALLEL_LINK_JOBS=1 : 强制单线程链接，防止 Bus Error (内存爆满)
+          #    - CMAKE_CXX_FLAGS="-g0"     : 彻底关闭调试符号，减小体积和内存占用
           #
-          # 2. CMAKE_CXX_FLAGS="-g0" :
-          #    强制关闭调试信息。日志显示即使是 Release 模式 NDK 也可能加上 -g。
-          #    去掉 -g 可以节省数 GB 的内存。
-          #
-          # 3. 之前的符号修复依然保留 (EXPORT_SYMBOLS + Static Link)。
+          # 2. 符号修复 (dlopen问题):
+          #    - LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON : 导出符号供 Pass 使用
+          #    - LLVM_BUILD_LLVM_DYLIB=OFF          : 必须关闭动态库构建以避免冲突
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -98,8 +104,8 @@ jobs:
 
       - name: Build OLLVM
         run: |
-          # 这里依然可以用多核编译 (-j)，因为我们已经限制了 LINK_JOBS 为 1
-          # Ninja 会自动管理：编译时全速，链接时排队。
+          # 编译并安装
+          # Ninja 会自动处理 -j 并发，但链接阶段会被限制为 1 个任务
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup & Prepare Artifacts
@@ -111,7 +117,10 @@ jobs:
 
       - name: Compress and Split (400MB Chunks)
         run: |
+          # 打包 -> 极限压缩 -> 分割
           tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-bindist.tar.xz."
+          
+          echo "Generated Parts:"
           ls -lh ollvm-bindist.tar.xz.*
 
       - name: Upload Artifacts (Split Parts)
