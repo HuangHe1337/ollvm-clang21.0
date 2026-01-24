@@ -1,4 +1,4 @@
-name: Build OLLVM Android (Termux) - Fix CMake Conflict
+name: Build OLLVM Android (Termux) - Fix Bus Error
 
 on:
   workflow_dispatch:
@@ -23,10 +23,11 @@ jobs:
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
-      - name: Create Massive Swap (20GB)
+      - name: Create Swap (16GB)
         run: |
-          # 20GB Swap 防止链接阶段内存溢出
-          sudo fallocate -l 20G /swapfile
+          # 16GB Swap 平衡内存需求和磁盘空间
+          # 如果 Swap 太大(20G+)，可能会挤占磁盘导致 Bus Error (Disk Full)
+          sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
@@ -56,18 +57,20 @@ jobs:
           echo "ANDROID_NDK_HOME=$NDK_ROOT" >> $GITHUB_ENV
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Conflict Fixed)
+      - name: Configure CMake (Memory Safe)
         run: |
           mkdir -p build
           
-          # === 修复说明 ===
-          # LLVM_LINK_LLVM_DYLIB=OFF (必须关闭): 
-          #   因为开启它会导致与 LLVM_EXPORT_SYMBOLS_FOR_PLUGINS 冲突。
-          #   我们选择静态链接模式。
+          # === 关键修复说明 ===
+          # 1. LLVM_PARALLEL_LINK_JOBS=1 : 
+          #    最重要的一行！强制一次只链接一个文件。
+          #    防止 clang 和 llvm-objdump 同时链接导致内存爆炸。
           #
-          # LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON (关键):
-          #   即使是静态链接，也强制 clang 导出符号，
-          #   这样你的 libSkeletonPass.so 就能找到 "_ZN4llvm..." 这些符号了。
+          # 2. CMAKE_CXX_FLAGS="-g0" :
+          #    强制关闭调试信息。日志显示即使是 Release 模式 NDK 也可能加上 -g。
+          #    去掉 -g 可以节省数 GB 的内存。
+          #
+          # 3. 之前的符号修复依然保留 (EXPORT_SYMBOLS + Static Link)。
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -75,6 +78,8 @@ jobs:
             -DANDROID_PLATFORM=android-29 \
             -DANDROID_STL=c++_shared \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
+            -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang" \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
@@ -82,6 +87,7 @@ jobs:
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_ENABLE_LTO=OFF \
             \
+            -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_ENABLE_PLUGINS=ON \
             -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
@@ -92,29 +98,20 @@ jobs:
 
       - name: Build OLLVM
         run: |
-          # 编译并安装
+          # 这里依然可以用多核编译 (-j)，因为我们已经限制了 LINK_JOBS 为 1
+          # Ninja 会自动管理：编译时全速，链接时排队。
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup & Prepare Artifacts
         run: |
           cd install_output
-          
-          # 清理静态库，因为我们现在是静态链接的 clang，
-          # lib/ 目录下的 .a 文件通常不再需要保留给最终用户。
           rm -rf lib/*.a 
-          
           echo "Size before compression:"
           du -sh .
 
       - name: Compress and Split (400MB Chunks)
         run: |
-          # 使用 tar 打包 -> xz 极限压缩 -> split 分割
-          # -C install_output . : 进入目录打包，解压时不会带 install_output 父文件夹
-          # -b 400M : 每个分卷最大 400MB
-          
           tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-bindist.tar.xz."
-          
-          echo "Generated Parts:"
           ls -lh ollvm-bindist.tar.xz.*
 
       - name: Upload Artifacts (Split Parts)
