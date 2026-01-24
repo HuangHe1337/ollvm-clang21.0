@@ -1,4 +1,4 @@
-name: Build OLLVM Android (Termux) - Final Fix
+name: Build OLLVM (Clang & LLD Only) - Termux
 
 on:
   workflow_dispatch:
@@ -10,38 +10,30 @@ on:
 
 jobs:
   build:
-    name: Build AArch64 OLLVM
+    name: Build Clang+LLD
     runs-on: ubuntu-24.04
     
     steps:
-      - name: Free Disk Space (Aggressive)
+      - name: Free Disk Space
         run: |
-          # 清理空间
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
           sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
-      - name: Recreate Swap (16GB)
+      - name: Setup Swap (16GB)
         run: |
-          # === 修复 Text file busy 错误 ===
-          # 1. 先关闭所有现有的 Swap (防止文件被占用)
+          # 重置 Swap 防止 Text file busy
           sudo swapoff -a || true
-          
-          # 2. 删除旧的 swapfile (如果存在)
           sudo rm -f /swapfile
-          
-          # 3. 创建新的 16GB Swap
           sudo fallocate -l 16G /swapfile
           sudo chmod 600 /swapfile
           sudo mkswap /swapfile
           sudo swapon /swapfile
-          
-          # 4. 验证 Swap 状态
           free -h
 
-      - name: Checkout OLLVM Source
+      - name: Checkout Source
         uses: actions/checkout@v4
         with:
           repository: lux-QAQ/ollvm-clang21.0
@@ -54,29 +46,23 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ninja-build cmake build-essential xz-utils
 
-      - name: Download & Setup Android NDK
-        id: setup-ndk
+      - name: Setup NDK
         run: |
-          echo "Downloading NDK ${{ inputs.ndk_version }}..."
           curl -sSfL -o android-ndk.zip "https://dl.google.com/android/repository/android-ndk-${{ inputs.ndk_version }}-linux.zip"
           unzip -qq android-ndk.zip
-          
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
-          echo "ANDROID_NDK_HOME=$NDK_ROOT" >> $GITHUB_ENV
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Memory Safe & Symbols Fixed)
+      - name: Configure CMake (Clang & LLD Only)
         run: |
           mkdir -p build
           
-          # === 配置说明 ===
-          # 1. 内存控制:
-          #    - LLVM_PARALLEL_LINK_JOBS=1 : 强制单线程链接，防止 Bus Error (内存爆满)
-          #    - CMAKE_CXX_FLAGS="-g0"     : 彻底关闭调试符号，减小体积和内存占用
-          #
-          # 2. 符号修复 (dlopen问题):
-          #    - LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON : 导出符号供 Pass 使用
-          #    - LLVM_BUILD_LLVM_DYLIB=OFF          : 必须关闭动态库构建以避免冲突
+          # === 配置详解 ===
+          # 1. LLVM_ENABLE_PROJECTS="clang;lld" : 只开启 Clang 和 LLD
+          # 2. LLVM_BUILD_TOOLS=OFF             : 不构建 llvm-objdump/bugpoint 等杂项 (解决报错的关键)
+          # 3. LLVM_INCLUDE_UTILS=OFF           : 不构建辅助工具
+          # 4. LLVM_EXPORT_SYMBOLS...=ON        : 强制导出符号 (解决 dlopen 报错)
+          # 5. LLVM_PARALLEL_LINK_JOBS=1        : 防止内存溢出
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -87,7 +73,9 @@ jobs:
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
-            -DLLVM_ENABLE_PROJECTS="clang" \
+            -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            -DLLVM_BUILD_TOOLS=OFF \
+            -DLLVM_INCLUDE_UTILS=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
@@ -102,28 +90,27 @@ jobs:
             \
             -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
 
-      - name: Build OLLVM
+      - name: Build & Install
         run: |
-          # 编译并安装
-          # Ninja 会自动处理 -j 并发，但链接阶段会被限制为 1 个任务
+          # 仅编译安装配置好的组件 (Clang + LLD)
           cmake --build build --target install -j$(nproc)
 
-      - name: Cleanup & Prepare Artifacts
+      - name: Cleanup Artifacts
         run: |
           cd install_output
+          # 删除静态库 (.a) 减小体积，只保留二进制和 .so
           rm -rf lib/*.a 
-          echo "Size before compression:"
+          
+          echo "Final Size:"
           du -sh .
 
-      - name: Compress and Split (400MB Chunks)
+      - name: Compress and Split
         run: |
-          # 打包 -> 极限压缩 -> 分割
+          # xz 极限压缩 + 400MB 分卷
           tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-bindist.tar.xz."
-          
-          echo "Generated Parts:"
           ls -lh ollvm-bindist.tar.xz.*
 
-      - name: Upload Artifacts (Split Parts)
+      - name: Upload Artifacts
         uses: actions/upload-artifact@v4
         with:
           name: ollvm-android-arm64-parts
