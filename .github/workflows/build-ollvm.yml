@@ -1,4 +1,4 @@
-name: Build OLLVM (Static + Release) - Termux Ready
+name: Build OLLVM (RTTI + Export Dynamic) - Fix Plugins
 
 on:
   workflow_dispatch:
@@ -9,11 +9,11 @@ on:
         required: true
 
 permissions:
-  contents: write  # 必须开启，否则无法上传 Release
+  contents: write
 
 jobs:
   build:
-    name: Build Clang/LLD (Static)
+    name: Build Clang (RTTI+FullExport)
     runs-on: ubuntu-24.04
     
     steps:
@@ -54,15 +54,14 @@ jobs:
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (Static & Plugin Support)
+      - name: Configure CMake (The Ultimate Fix)
         run: |
           mkdir -p build
           
-          # === 关键修复 ===
-          # 1. ANDROID_STL=c++_static          : 静态链接 libc++，解决 "libc++_shared.so not found"
-          # 2. LLVM_STATIC_LINK_CXX_STDLIB=ON  : 再次强制 LLVM 使用静态 C++ 库
-          # 3. LLVM_BUILD_TOOLS=OFF            : 不编译杂项工具，只编译 clang/lld
-          # 4. LLVM_EXPORT_SYMBOLS...=ON       : 即使静态链接，也导出符号供 Pass 插件使用
+          # === 核心修复参数 ===
+          # 1. LLVM_ENABLE_RTTI=ON : 开启 RTTI，解决 _ZTI (typeinfo) 报错
+          # 2. CMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" : 暴力导出所有符号，解决 _ZTV (vtable) 报错
+          # 3. LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON : 配合上面的选项双重保险
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -72,6 +71,7 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_BUILD_TOOLS=OFF \
@@ -81,6 +81,7 @@ jobs:
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_ENABLE_LTO=OFF \
             \
+            -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLLVM_ENABLE_PLUGINS=ON \
@@ -93,42 +94,35 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 开始编译
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup Artifacts
         run: |
           cd install_output
-          # 删除静态库 (.a) 减小体积 (Termux用户不需要这些去二次开发LLVM)
           rm -rf lib/*.a 
-          
-          echo "Build finished. Final size:"
+          echo "Final Size:"
           du -sh .
 
       - name: Compress and Split
         run: |
-          # 打包 -> xz压缩 -> 分割(400M)
-          # 文件名: ollvm-android.tar.xz.aa, ollvm-android.tar.xz.ab ...
           tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-android.tar.xz."
-          
           ls -lh ollvm-android.tar.xz.*
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-build-${{ github.run_number }}
-          name: OLLVM Build ${{ github.run_number }} (Termux/Android)
+          tag_name: ollvm-rtti-${{ github.run_number }}
+          name: OLLVM (RTTI + Export Dynamic) Build ${{ github.run_number }}
           body: |
-            Build of OLLVM for Android (AArch64).
+            Build of OLLVM for Android (AArch64) with Plugin Support fixes.
             
-            **Configuration:**
-            - NDK: ${{ inputs.ndk_version }}
-            - Projects: Clang, LLD
-            - Linking: Static (libc++_static), No dependency on libc++_shared.so
-            - Plugin Support: Enabled (Exported Symbols)
+            **Fixes:**
+            - **RTTI Enabled (`-DLLVM_ENABLE_RTTI=ON`)**: Fixes `dlopen failed: cannot locate symbol _ZTI...` (typeinfo).
+            - **Export Dynamic (`-Wl,--export-dynamic`)**: Fixes `dlopen failed: cannot locate symbol _ZTV...` (vtable).
+            - **Static Linking**: No dependencies on `libc++_shared.so`.
             
-            **How to use:**
+            **Usage:**
             Download all parts and run:
             `cat ollvm-android.tar.xz.* | tar -xJ`
           files: |
