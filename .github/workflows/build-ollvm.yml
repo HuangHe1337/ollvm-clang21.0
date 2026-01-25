@@ -1,4 +1,4 @@
-name: Build OLLVM (DYLIB + RTTI) - Perfect Plugin Support
+name: Build OLLVM (Nuclear Option) - Visibility Default
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Clang (DYLIB Mode)
+    name: Build Clang (Nuclear Config)
     runs-on: ubuntu-24.04
     
     steps:
@@ -22,7 +22,6 @@ jobs:
           sudo rm -rf /usr/share/dotnet
           sudo rm -rf /usr/local/lib/android
           sudo rm -rf /opt/ghc
-          sudo rm -rf /opt/hostedtoolcache/CodeQL
           sudo docker image prune --all --force
 
       - name: Setup Swap (16GB)
@@ -54,16 +53,16 @@ jobs:
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (DYLIB Mode)
+      - name: Configure CMake (The Nuclear Fix)
         run: |
           mkdir -p build
           
-          # === 核心修复逻辑 ===
-          # 1. LLVM_BUILD_LLVM_DYLIB=ON : 生成 libLLVM.so (包含所有符号，解决 vtable 缺失)
-          # 2. LLVM_LINK_LLVM_DYLIB=ON  : 让 Clang 链接到 libLLVM.so
-          # 3. LLVM_EXPORT_SYMBOLS...=OFF : 必须关闭！因为它与 DYLIB 冲突
-          # 4. LLVM_ENABLE_RTTI=ON      : 保持开启，解决 libxVMP 的 typeinfo 问题
-          # 5. ANDROID_STL=c++_static   : 依然保持静态链接 libc++，方便移植
+          # === 核弹级修复逻辑 ===
+          # 1. 回归静态链接 (Static): 避免 .so 符号隐藏问题，所有代码打入 clang。
+          # 2. CMAKE_CXX_FLAGS="-fvisibility=default": 核心！强制所有 C++ 类可见，解决 _ZTV (vtable) 缺失。
+          # 3. CMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic": 核心！强制导出主程序符号给插件 dlopen 用。
+          # 4. LLVM_ENABLE_RTTI=ON: 解决插件的 dynamic_cast / typeid 报错。
+          # 5. ANDROID_STL=c++_static: 解决 libc++_shared 找不到的问题。
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -71,8 +70,11 @@ jobs:
             -DANDROID_PLATFORM=android-29 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
-            -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
+            \
+            -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG -fvisibility=default" \
+            -DCMAKE_C_FLAGS="-g0 -DNDEBUG -fvisibility=default" \
+            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" \
+            \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_BUILD_TOOLS=OFF \
@@ -82,10 +84,9 @@ jobs:
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_ENABLE_LTO=OFF \
             \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
-            \
+            -DLLVM_BUILD_LLVM_DYLIB=OFF \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
@@ -96,46 +97,43 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 这一步会消耗较大内存链接 libLLVM.so，但我们有 Swap 且限制了单线程链接
+          # 静态链接+全符号导出，链接时间会较长，请耐心等待
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup Artifacts
         run: |
           cd install_output
-          # 删除静态库 (.a)，但必须保留 lib/libLLVM.so (核心文件)
+          # 删除静态库，因为我们已经把逻辑都打进 clang 二进制了
           rm -rf lib/*.a 
-          
-          echo "Check for libLLVM.so:"
-          ls -lh lib/libLLVM*.so || echo "WARNING: libLLVM.so not found!"
           
           echo "Final Size:"
           du -sh .
 
       - name: Compress and Split
         run: |
-          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-dylib.tar.xz."
-          ls -lh ollvm-dylib.tar.xz.*
+          # 静态链接的 clang 二进制文件会比较大，这是正常的
+          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-nuclear.tar.xz."
+          ls -lh ollvm-nuclear.tar.xz.*
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-dylib-${{ github.run_number }}
-          name: OLLVM (DYLIB Mode) Build ${{ github.run_number }}
+          tag_name: ollvm-nuclear-${{ github.run_number }}
+          name: OLLVM (Nuclear: Visibility Default) Build ${{ github.run_number }}
           body: |
-            Build of OLLVM for Android (AArch64) with **Full Plugin Support**.
+            Build of OLLVM for Android (AArch64) with **Maximum Compatibility**.
             
-            **Configuration:**
-            - **Mode**: DYLIB (`libLLVM.so` enabled). This solves `_ZTV` (vtable) errors.
-            - **RTTI**: Enabled. This solves `_ZTI` (typeinfo) errors.
-            - **STL**: Static (`libc++_static`).
+            **Fixes Applied:**
+            - **`libxVMP.so` Fix**: `-fvisibility=default` ensures `IRBuilder` vtables are visible.
+            - **`libSkeletonPass.so` Fix**: `-Wl,--export-dynamic` forces `clang` to share all symbols with plugins.
+            - **Run Requirements**: Fully Static Build. No external `.so` needed (except system libs).
             
-            **Important Usage Note:**
-            This build relies on `lib/libLLVM.so`.
-            When extracting, keep the directory structure (`bin/` and `lib/`).
-            If clang fails to run inside Termux, setup library path:
-            `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/extracted/lib`
+            **Installation:**
+            1. Download and extract.
+            2. Copy `bin/*` to your NDK `bin/`.
+            3. No `libLLVM.so` needed, clang is standalone.
           files: |
-            ollvm-dylib.tar.xz.*
+            ollvm-nuclear.tar.xz.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
