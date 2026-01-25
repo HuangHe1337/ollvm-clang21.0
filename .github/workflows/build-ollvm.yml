@@ -97,21 +97,17 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 静态链接+全符号导出，链接时间会较长，请耐心等待
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup Artifacts
         run: |
           cd install_output
-          # 删除静态库，因为我们已经把逻辑都打进 clang 二进制了
           rm -rf lib/*.a 
-          
           echo "Final Size:"
           du -sh .
 
       - name: Compress and Split
         run: |
-          # 静态链接的 clang 二进制文件会比较大，这是正常的
           tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-nuclear.tar.xz."
           ls -lh ollvm-nuclear.tar.xz.*
 
@@ -120,7 +116,8 @@ jobs:
         if: success()
         with:
           tag_name: ollvm-nuclear-${{ github.run_number }}
-          name: OLLVM (Nuclear: Visibility Default) Build ${{ github.run_number }}
+          # 修复点：加上双引号
+          name: "OLLVM (Nuclear: Visibility Default) Build ${{ github.run_number }}"
           body: |
             Build of OLLVM for Android (AArch64) with **Maximum Compatibility**.
             
