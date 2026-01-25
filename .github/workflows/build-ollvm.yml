@@ -1,4 +1,4 @@
-name: Build OLLVM (RTTI + Export Dynamic) - Fix Plugins
+name: Build OLLVM (DYLIB + RTTI) - Perfect Plugin Support
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Clang (RTTI+FullExport)
+    name: Build Clang (DYLIB Mode)
     runs-on: ubuntu-24.04
     
     steps:
@@ -54,14 +54,16 @@ jobs:
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (The Ultimate Fix)
+      - name: Configure CMake (DYLIB Mode)
         run: |
           mkdir -p build
           
-          # === 核心修复参数 ===
-          # 1. LLVM_ENABLE_RTTI=ON : 开启 RTTI，解决 _ZTI (typeinfo) 报错
-          # 2. CMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" : 暴力导出所有符号，解决 _ZTV (vtable) 报错
-          # 3. LLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON : 配合上面的选项双重保险
+          # === 核心修复逻辑 ===
+          # 1. LLVM_BUILD_LLVM_DYLIB=ON : 生成 libLLVM.so (包含所有符号，解决 vtable 缺失)
+          # 2. LLVM_LINK_LLVM_DYLIB=ON  : 让 Clang 链接到 libLLVM.so
+          # 3. LLVM_EXPORT_SYMBOLS...=OFF : 必须关闭！因为它与 DYLIB 冲突
+          # 4. LLVM_ENABLE_RTTI=ON      : 保持开启，解决 libxVMP 的 typeinfo 问题
+          # 5. ANDROID_STL=c++_static   : 依然保持静态链接 libc++，方便移植
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -71,7 +73,6 @@ jobs:
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_BUILD_TOOLS=OFF \
@@ -81,51 +82,60 @@ jobs:
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_ENABLE_LTO=OFF \
             \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
+            \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
             -DLLVM_ENABLE_PLUGINS=ON \
-            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
-            -DLLVM_BUILD_LLVM_DYLIB=OFF \
-            -DLLVM_LINK_LLVM_DYLIB=OFF \
             -DCMAKE_INSTALL_DO_STRIP=OFF \
             \
             -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
 
       - name: Build & Install
         run: |
+          # 这一步会消耗较大内存链接 libLLVM.so，但我们有 Swap 且限制了单线程链接
           cmake --build build --target install -j$(nproc)
 
       - name: Cleanup Artifacts
         run: |
           cd install_output
+          # 删除静态库 (.a)，但必须保留 lib/libLLVM.so (核心文件)
           rm -rf lib/*.a 
+          
+          echo "Check for libLLVM.so:"
+          ls -lh lib/libLLVM*.so || echo "WARNING: libLLVM.so not found!"
+          
           echo "Final Size:"
           du -sh .
 
       - name: Compress and Split
         run: |
-          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-android.tar.xz."
-          ls -lh ollvm-android.tar.xz.*
+          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-dylib.tar.xz."
+          ls -lh ollvm-dylib.tar.xz.*
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-rtti-${{ github.run_number }}
-          name: OLLVM (RTTI + Export Dynamic) Build ${{ github.run_number }}
+          tag_name: ollvm-dylib-${{ github.run_number }}
+          name: OLLVM (DYLIB Mode) Build ${{ github.run_number }}
           body: |
-            Build of OLLVM for Android (AArch64) with Plugin Support fixes.
+            Build of OLLVM for Android (AArch64) with **Full Plugin Support**.
             
-            **Fixes:**
-            - **RTTI Enabled (`-DLLVM_ENABLE_RTTI=ON`)**: Fixes `dlopen failed: cannot locate symbol _ZTI...` (typeinfo).
-            - **Export Dynamic (`-Wl,--export-dynamic`)**: Fixes `dlopen failed: cannot locate symbol _ZTV...` (vtable).
-            - **Static Linking**: No dependencies on `libc++_shared.so`.
+            **Configuration:**
+            - **Mode**: DYLIB (`libLLVM.so` enabled). This solves `_ZTV` (vtable) errors.
+            - **RTTI**: Enabled. This solves `_ZTI` (typeinfo) errors.
+            - **STL**: Static (`libc++_static`).
             
-            **Usage:**
-            Download all parts and run:
-            `cat ollvm-android.tar.xz.* | tar -xJ`
+            **Important Usage Note:**
+            This build relies on `lib/libLLVM.so`.
+            When extracting, keep the directory structure (`bin/` and `lib/`).
+            If clang fails to run inside Termux, setup library path:
+            `export LD_LIBRARY_PATH=$LD_LIBRARY_PATH:/path/to/extracted/lib`
           files: |
-            ollvm-android.tar.xz.*
+            ollvm-dylib.tar.xz.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
