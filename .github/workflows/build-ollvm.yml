@@ -1,4 +1,4 @@
-name: Build OLLVM (Nuclear Option) - Visibility Default
+name: Build OLLVM (DYLIB + Wrapper) - The Final Fix
 
 on:
   workflow_dispatch:
@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Clang (Nuclear Config)
+    name: Build Clang (DYLIB+Wrapper)
     runs-on: ubuntu-24.04
     
     steps:
@@ -53,16 +53,14 @@ jobs:
           NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
           echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
 
-      - name: Configure CMake (The Nuclear Fix)
+      - name: Configure CMake (DYLIB Mode)
         run: |
           mkdir -p build
           
-          # === 核弹级修复逻辑 ===
-          # 1. 回归静态链接 (Static): 避免 .so 符号隐藏问题，所有代码打入 clang。
-          # 2. CMAKE_CXX_FLAGS="-fvisibility=default": 核心！强制所有 C++ 类可见，解决 _ZTV (vtable) 缺失。
-          # 3. CMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic": 核心！强制导出主程序符号给插件 dlopen 用。
-          # 4. LLVM_ENABLE_RTTI=ON: 解决插件的 dynamic_cast / typeid 报错。
-          # 5. ANDROID_STL=c++_static: 解决 libc++_shared 找不到的问题。
+          # === 策略说明 ===
+          # 1. 开启 DYLIB: 生成 libLLVM.so 和 libclang-cpp.so。这包含了所有符号，绝不会报 symbol missing。
+          # 2. 静态 STL: 避免依赖 libc++_shared.so。
+          # 3. 插件支持: 开启 RTTI 和 Plugin 支持。
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
@@ -70,11 +68,8 @@ jobs:
             -DANDROID_PLATFORM=android-29 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
-            \
-            -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG -fvisibility=default" \
-            -DCMAKE_C_FLAGS="-g0 -DNDEBUG -fvisibility=default" \
-            -DCMAKE_EXE_LINKER_FLAGS="-Wl,--export-dynamic" \
-            \
+            -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
+            -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             -DLLVM_TARGETS_TO_BUILD="AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             -DLLVM_BUILD_TOOLS=OFF \
@@ -84,9 +79,10 @@ jobs:
             -DLLVM_INCLUDE_EXAMPLES=OFF \
             -DLLVM_ENABLE_LTO=OFF \
             \
-            -DLLVM_BUILD_LLVM_DYLIB=OFF \
-            -DLLVM_LINK_LLVM_DYLIB=OFF \
-            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_PARALLEL_LINK_JOBS=1 \
             -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
@@ -99,6 +95,41 @@ jobs:
         run: |
           cmake --build build --target install -j$(nproc)
 
+      - name: Create Wrapper Scripts
+        run: |
+          cd install_output/bin
+          
+          # === 创建启动脚本 ===
+          # 既然 RPATH 在某些环境下不稳定，我们直接生成一个 wrapper 脚本。
+          # 这个脚本会自动把 ../lib 目录加入 LD_LIBRARY_PATH，确保 100% 能找到库。
+          
+          # 重命名原文件
+          mv clang clang.real
+          mv clang++ clang++.real
+          
+          # 创建 clang 脚本
+          cat <<EOF > clang
+          #!/bin/sh
+          # 获取脚本所在目录的上一级目录下的 lib
+          DIR=\$(cd "\$(dirname "\$0")"; pwd)
+          ROOT_DIR=\$(dirname "\$DIR")
+          export LD_LIBRARY_PATH="\$ROOT_DIR/lib:\$ROOT_DIR/lib64:\$LD_LIBRARY_PATH"
+          exec "\$DIR/clang.real" "\$@"
+          EOF
+          
+          # 创建 clang++ 脚本
+          cat <<EOF > clang++
+          #!/bin/sh
+          DIR=\$(cd "\$(dirname "\$0")"; pwd)
+          ROOT_DIR=\$(dirname "\$DIR")
+          export LD_LIBRARY_PATH="\$ROOT_DIR/lib:\$ROOT_DIR/lib64:\$LD_LIBRARY_PATH"
+          exec "\$DIR/clang++.real" "\$@"
+          EOF
+          
+          chmod +x clang clang++
+          
+          echo "Wrapper scripts created."
+
       - name: Cleanup Artifacts
         run: |
           cd install_output
@@ -108,29 +139,27 @@ jobs:
 
       - name: Compress and Split
         run: |
-          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-nuclear.tar.xz."
-          ls -lh ollvm-nuclear.tar.xz.*
+          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-wrapper.tar.xz."
+          ls -lh ollvm-wrapper.tar.xz.*
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-nuclear-${{ github.run_number }}
-          # 修复点：加上双引号
-          name: "OLLVM (Nuclear: Visibility Default) Build ${{ github.run_number }}"
+          tag_name: ollvm-wrapper-${{ github.run_number }}
+          name: "OLLVM (DYLIB + Wrapper) Build ${{ github.run_number }}"
           body: |
-            Build of OLLVM for Android (AArch64) with **Maximum Compatibility**.
+            Build of OLLVM for Android (AArch64) with **Wrapper Scripts**.
             
-            **Fixes Applied:**
-            - **`libxVMP.so` Fix**: `-fvisibility=default` ensures `IRBuilder` vtables are visible.
-            - **`libSkeletonPass.so` Fix**: `-Wl,--export-dynamic` forces `clang` to share all symbols with plugins.
-            - **Run Requirements**: Fully Static Build. No external `.so` needed (except system libs).
+            **Why this version?**
+            - **Fixes `symbol not found`**: Uses `libLLVM.so` / `libclang-cpp.so` which contain ALL symbols (including `noteBottomOfStack`).
+            - **Fixes `library not found`**: Includes `clang` and `clang++` wrapper scripts that auto-set `LD_LIBRARY_PATH`.
             
             **Installation:**
-            1. Download and extract.
-            2. Copy `bin/*` to your NDK `bin/`.
-            3. No `libLLVM.so` needed, clang is standalone.
+            1. Extract to a folder.
+            2. Copy `bin/` and `lib/` to your NDK or Termux location.
+            3. **Use `bin/clang` directly**. It is a script that sets up the environment and calls `bin/clang.real`.
           files: |
-            ollvm-nuclear.tar.xz.*
+            ollvm-wrapper.tar.xz.*
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
