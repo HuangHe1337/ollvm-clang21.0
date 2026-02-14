@@ -1,4 +1,4 @@
-name: Build OLLVM Xcode Toolchain
+name: Build OLLVM Xcode Toolchain (Arm64 Native)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build Xcode Toolchain (Universal)
+    name: Build OLLVM (Apple Silicon Only)
     runs-on: macos-latest
     
     steps:
@@ -20,28 +20,27 @@ jobs:
           path: llvm-project
           fetch-depth: 1
 
-      - name: Install Dependencies
+      - name: Install Build Tools
         run: |
-          brew install ninja cmake xz
+          brew install ninja cmake
           
-      - name: Configure CMake (Xcode Toolchain Layout)
+      - name: Configure CMake (Stable Arm64)
         run: |
           mkdir -p build
           
-          # 定义工具链名称和安装路径
           TOOLCHAIN_NAME="OLLVM"
+          # Xcode 工具链标准路径结构
           INSTALL_DIR="$(pwd)/${TOOLCHAIN_NAME}.xctoolchain/usr"
-          
           echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
           
-          # 注意：
-          # 1. CMAKE_INSTALL_PREFIX 指向 .xctoolchain/usr
-          # 2. 依然保持 RTTI 和 Plugin 支持
-          # 3. 构建 Universal Binary (arm64 + x86_64)
+          # === 核心配置说明 ===
+          # 1. CMAKE_OSX_ARCHITECTURES="arm64" : 只构建 Arm64，100% 避免链接错误
+          # 2. LLVM_ENABLE_ZSTD=OFF等 : 关闭非必要依赖，防止不同机器环境库版本不一致导致崩溃
+          # 3. LLVM_TARGETS_TO_BUILD : 依然支持生成 X86 代码（为了兼容模拟器或旧Mac构建）
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" \
+            -DCMAKE_OSX_ARCHITECTURES="arm64" \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             \
@@ -53,28 +52,31 @@ jobs:
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
+            \
             -DLLVM_ENABLE_LTO=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
             \
             -DLLVM_ENABLE_RTTI=ON \
             -DLLVM_ENABLE_PLUGINS=ON \
             -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=ON \
             -DLLVM_BUILD_LLVM_DYLIB=OFF \
             -DLLVM_LINK_LLVM_DYLIB=OFF \
-            -DCMAKE_INSTALL_DO_STRIP=OFF \
+            -DCMAKE_INSTALL_DO_STRIP=ON \
             \
             -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}"
 
       - name: Build & Install
         run: |
+          # 既然是纯 Arm64，构建速度会比 Universal 快很多
           cmake --build build --target install
 
-      - name: Create Info.plist
+      - name: Setup Toolchain Structure
         run: |
-          # Xcode 需要 Info.plist 才能识别工具链
-          # 我们在 .xctoolchain 根目录下创建它
-          
           cd OLLVM.xctoolchain
           
+          # 1. 创建 Info.plist (Xcode 识别必须)
           cat > Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -87,7 +89,7 @@ jobs:
               <key>CompatibilityVersionDisplayString</key>
               <string>2.0</string>
               <key>CFBundleDisplayName</key>
-              <string>OLLVM 21.0</string>
+              <string>OLLVM 21.0 (Arm64)</string>
               <key>CFBundleVersion</key>
               <string>21.0.0</string>
               <key>CFBundleShortVersionString</key>
@@ -98,65 +100,62 @@ jobs:
           </plist>
           EOF
           
-          echo "Info.plist created."
-          cat Info.plist
-
-      - name: Cleanup & Sanitize
-        run: |
-          cd OLLVM.xctoolchain/usr
-          # 清理静态库以减小体积
-          rm -rf lib/*.a 
-          # 删除 cmake 文件，Xcode 不需要
-          rm -rf lib/cmake
+          # 2. 清理无用文件 (减小体积，防止干扰)
+          cd usr
+          rm -rf lib/*.a lib/cmake include share
           
-          # 创建必要的符号链接，确保 Xcode 能找到 c++ 编译器
-          # 虽然 cmake install 通常会做，但确保一下
+          # 3. 修复符号链接 (Xcode 需要 cc/c++/clang++)
           cd bin
           if [ ! -f "clang++" ]; then ln -s clang clang++; fi
           if [ ! -f "cc" ]; then ln -s clang cc; fi
           if [ ! -f "c++" ]; then ln -s clang c++; fi
 
-      - name: Compress Toolchain
+      - name: Ad-hoc Sign Binaries
         run: |
-          # 打包整个 OLLVM.xctoolchain 文件夹
-          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-xcode-toolchain.tar.xz
-          
-          ls -lh ollvm-xcode-toolchain.tar.xz
+          # 这是一个重要步骤：对二进制进行 Ad-hoc 签名
+          # 虽然不能替代 Apple 开发者签名，但能解决部分 "killed: 9" 或无法运行的问题
+          find OLLVM.xctoolchain/usr/bin -type f -perm +111 -exec codesign --force --deep -s - {} \;
+          echo "Binaries signed with ad-hoc signature."
+
+      - name: Compress
+        run: |
+          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-arm64-xcode.tar.xz
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-xcode-${{ github.run_number }}
-          name: OLLVM Xcode Toolchain (Build ${{ github.run_number }})
+          tag_name: ollvm-arm64-${{ github.run_number }}
+          name: OLLVM for Xcode (Apple Silicon Native)
           body: |
-            **Xcode Toolchain build of OLLVM (macOS Universal)**
+            **OLLVM Xcode Toolchain (Arm64 Native)**
             
-            Based on Clang 21.0 with Obfuscation features.
+            Optimized for M1/M2/M3 Macs. 
+            Contains `clang 21.0.0` with Obfuscation support.
             
-            ### How to install in Xcode:
+            ### Installation Instructions (Please follow strictly):
             
-            1. Download and extract:
-               `tar -xf ollvm-xcode-toolchain.tar.xz`
+            1. **Download & Extract**:
+               Download `ollvm-arm64-xcode.tar.xz` and extract it.
             
-            2. Move to the Toolchains directory (create if not exists):
-               ```bash
-               mkdir -p ~/Library/Developer/Toolchains
-               mv OLLVM.xctoolchain ~/Library/Developer/Toolchains/
-               ```
-               *(Or install system-wide in `/Library/Developer/Toolchains/`)*
+            2. **Install**:
+               Move the `OLLVM.xctoolchain` folder to:
+               `~/Library/Developer/Toolchains/`
+               *(Create the folder if it doesn't exist)*
             
-            3. **Important:** Remove quarantine attribute (fix "unverified developer" error):
+            3. **Bypass Gatekeeper (Crucial)**:
+               Run this command in Terminal to fix "Unverified Developer" errors:
                ```bash
                xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain
                ```
+               *Without this, Xcode will not be able to run the compiler.*
             
-            4. Open Xcode, go to **Xcode -> Toolchains** and select **OLLVM 21.0**.
-            
-            ### Usage:
-            Add flags to "Other C Flags" in Build Settings:
-            `-mllvm -sub -mllvm -fla -mllvm -bcf`
+            4. **Usage**:
+               - Restart Xcode.
+               - Menu: **Xcode** -> **Toolchains** -> Select **OLLVM 21.0 (Arm64)**.
+               - Add Flags in Build Settings -> Other C Flags:
+                 `-mllvm -sub -mllvm -fla -mllvm -bcf`
           files: |
-            ollvm-xcode-toolchain.tar.xz
+            ollvm-arm64-xcode.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
