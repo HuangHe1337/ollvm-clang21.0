@@ -1,4 +1,4 @@
-name: Build OLLVM for Xcode (Fixed Dylib)
+name: Build OLLVM Perfect (Dylib ON + Plugins OFF)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ permissions:
 
 jobs:
   build:
-    name: Build OLLVM (Arm64 + Dylib)
+    name: Build OLLVM (Arm64 + Dylib - Plugins)
     runs-on: macos-latest
     
     steps:
@@ -24,7 +24,7 @@ jobs:
         run: |
           brew install ninja cmake
           
-      - name: Configure CMake (Xcode Compatible)
+      - name: Configure CMake (The Golden Config)
         run: |
           mkdir -p build
           
@@ -32,12 +32,11 @@ jobs:
           INSTALL_DIR="$(pwd)/${TOOLCHAIN_NAME}.xctoolchain/usr"
           echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
           
-          # === 关键修正策略 ===
-          # 1. LLVM_BUILD_LLVM_DYLIB=ON  : 必须开启！Xcode 需要 libLLVM/libclang.dylib
-          # 2. CLANG_LINK_CLANG_DYLIB=ON : 让 Clang 链接到动态库，减小体积并符合 Xcode 规范
-          # 3. LLVM_ENABLE_PLUGINS=OFF   : 关键！关闭插件支持。
-          #    这解决了 "undefined symbol: runOnNewStackImpl" 报错，
-          #    同时因为 OLLVM 源码已内置，我们不需要插件也能混淆。
+          # === 核心逻辑 ===
+          # 1. LLVM_BUILD_LLVM_DYLIB=ON  : 开启！Xcode 必须要有这个才能索引。
+          # 2. CLANG_LINK_CLANG_DYLIB=ON : 开启！让 Clang 依赖动态库。
+          # 3. LLVM_ENABLE_PLUGINS=OFF   : 关闭！这是解决 runOnNewStackImpl 报错的关键。
+          #    (只要关了这个，就不会强制导出内部符号，链接就必定成功)
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
@@ -72,7 +71,7 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 编译 Clang、LLD 和最重要的 libclang
+          # 显式指定构建 install-libclang，确保动态库被生成并安装
           cmake --build build --target install-clang install-lld install-libclang install-clang-resource-headers
 
       - name: Setup Toolchain Structure
@@ -92,27 +91,26 @@ jobs:
               <key>CompatibilityVersionDisplayString</key>
               <string>2.0</string>
               <key>CFBundleDisplayName</key>
-              <string>OLLVM 21.0 (Dylib)</string>
+              <string>OLLVM 21.0</string>
               <key>CFBundleVersion</key>
               <string>21.0.0</string>
               <key>CFBundleShortVersionString</key>
               <string>21.0.0</string>
-              <key>ReportProblemURL</key>
-              <string>https://github.com/lux-QAQ/ollvm-clang21.0</string>
           </dict>
           </plist>
           EOF
           
-          # 2. 清理 (注意：这次不能删 lib/*.dylib)
+          # 2. 清理 (千万别删 lib/*.dylib)
           cd usr
-          # 仅删除静态库 (.a) 和 cmake 脚本
-          rm -rf lib/*.a lib/cmake
-          # 删除不需要的工具 (如 llvm-config 等，如果有残留)
-          rm -rf share libexec
+          rm -rf lib/*.a lib/cmake include share
           
-          # 3. 检查动态库是否存在 (调试用)
-          echo "Checking for libclang.dylib..."
-          find lib -name "libclang.dylib"
+          # 3. 验证动态库存在 (如果没有，Xcode 就会报 Explicit modules 错)
+          if [ -f "lib/libclang.dylib" ]; then
+             echo "SUCCESS: libclang.dylib exists!"
+          else
+             echo "ERROR: libclang.dylib missing!"
+             exit 1
+          fi
           
           # 4. 符号链接
           cd bin
@@ -122,36 +120,32 @@ jobs:
 
       - name: Ad-hoc Sign Binaries
         run: |
-          # 签名所有二进制和动态库
+          # 必须对 dylib 进行签名，否则 Xcode 可能会拒绝加载
           find OLLVM.xctoolchain/usr -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --deep -s - {} \;
 
       - name: Compress
         run: |
-          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-dylib-arm64.tar.xz
+          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-xcode-final.tar.xz
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-dylib-${{ github.run_number }}
-          name: OLLVM Xcode Toolchain (With Dylib)
+          tag_name: ollvm-final-${{ github.run_number }}
+          name: OLLVM Xcode Toolchain (Perfect Build)
           body: |
-            **OLLVM Xcode Toolchain (Arm64 Native + Dylib)**
+            **OLLVM Xcode Toolchain (Arm64 Native)**
             
-            **Fixes:**
-            - Solves `Explicit modules is enabled but could not resolve libclang.dylib`.
-            - Contains `libclang.dylib` required by Xcode 15/16.
-            - `Plugins` disabled to prevent linker errors (OLLVM is built-in).
+            **Verification:**
+            - Contains `libclang.dylib` -> Fixes "Explicit modules" error.
+            - Plugins Disabled -> Fixes linker `runOnNewStackImpl` error.
+            - Ad-hoc Signed -> Ready for M1/M2/M3.
             
-            **Installation:**
-            
-            1. Extract `ollvm-dylib-arm64.tar.xz`.
-            2. Move `OLLVM.xctoolchain` to `~/Library/Developer/Toolchains/`.
-            3. **Gatekeeper Fix (Required):**
-               ```bash
-               xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain
-               ```
+            **Install:**
+            1. `tar -xf ollvm-xcode-final.tar.xz`
+            2. `mv OLLVM.xctoolchain ~/Library/Developer/Toolchains/`
+            3. `xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain` (必须执行!)
           files: |
-            ollvm-dylib-arm64.tar.xz
+            ollvm-xcode-final.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
