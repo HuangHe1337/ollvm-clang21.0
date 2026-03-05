@@ -1,4 +1,4 @@
-name: Build OLLVM Perfect (Dylib ON + Plugins OFF)
+name: Build OLLVM for Intel/Hackintosh (x86_64)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,8 @@ permissions:
 
 jobs:
   build:
-    name: Build OLLVM (Arm64 + Dylib - Plugins)
+    name: Build OLLVM (Intel x86_64)
+    # GitHub 的 macos-latest 现在通常是 Arm64，但我们可以交叉编译生成 Intel 版本
     runs-on: macos-latest
     
     steps:
@@ -24,7 +25,7 @@ jobs:
         run: |
           brew install ninja cmake
           
-      - name: Configure CMake (The Golden Config)
+      - name: Configure CMake (Intel x86_64 Target)
         run: |
           mkdir -p build
           
@@ -32,19 +33,18 @@ jobs:
           INSTALL_DIR="$(pwd)/${TOOLCHAIN_NAME}.xctoolchain/usr"
           echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
           
-          # === 核心逻辑 ===
-          # 1. LLVM_BUILD_LLVM_DYLIB=ON  : 开启！Xcode 必须要有这个才能索引。
-          # 2. CLANG_LINK_CLANG_DYLIB=ON : 开启！让 Clang 依赖动态库。
-          # 3. LLVM_ENABLE_PLUGINS=OFF   : 关闭！这是解决 runOnNewStackImpl 报错的关键。
-          #    (只要关了这个，就不会强制导出内部符号，链接就必定成功)
+          # === Intel 黑苹果核心配置 ===
+          # 1. CMAKE_OSX_ARCHITECTURES="x86_64" : 强制构建 Intel 版本！
+          # 2. LLVM_BUILD_LLVM_DYLIB=ON         : 生成 libclang.dylib (Xcode 必须)
+          # 3. LLVM_ENABLE_PLUGINS=OFF          : 关闭插件 (解决链接报错)
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_OSX_ARCHITECTURES="arm64" \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64" \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             \
-            -DLLVM_TARGETS_TO_BUILD="AArch64;X86" \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
             \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
@@ -71,14 +71,14 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 显式指定构建 install-libclang，确保动态库被生成并安装
+          # 构建 clang, lld 以及 Xcode 必须的 libclang
           cmake --build build --target install-clang install-lld install-libclang install-clang-resource-headers
 
       - name: Setup Toolchain Structure
         run: |
           cd OLLVM.xctoolchain
           
-          # 1. Info.plist
+          # 1. 生成 Info.plist
           cat > Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,7 +91,7 @@ jobs:
               <key>CompatibilityVersionDisplayString</key>
               <string>2.0</string>
               <key>CFBundleDisplayName</key>
-              <string>OLLVM 21.0</string>
+              <string>OLLVM 21.0 (Intel)</string>
               <key>CFBundleVersion</key>
               <string>21.0.0</string>
               <key>CFBundleShortVersionString</key>
@@ -100,19 +100,22 @@ jobs:
           </plist>
           EOF
           
-          # 2. 清理 (千万别删 lib/*.dylib)
+          # 2. 清理无用文件 (保留 lib/*.dylib)
           cd usr
-          rm -rf lib/*.a lib/cmake include share
+          rm -rf lib/*.a lib/cmake include share libexec
           
-          # 3. 验证动态库存在 (如果没有，Xcode 就会报 Explicit modules 错)
+          # 3. 验证构建结果 (确保 libclang.dylib 存在)
           if [ -f "lib/libclang.dylib" ]; then
-             echo "SUCCESS: libclang.dylib exists!"
+             echo "Verification Passed: libclang.dylib exists."
           else
-             echo "ERROR: libclang.dylib missing!"
+             echo "Error: libclang.dylib missing!"
              exit 1
           fi
           
-          # 4. 符号链接
+          # 4. 检查架构 (确保是 x86_64)
+          file bin/clang
+          
+          # 5. 符号链接
           cd bin
           if [ ! -f "clang++" ]; then ln -s clang clang++; fi
           if [ ! -f "cc" ]; then ln -s clang cc; fi
@@ -120,32 +123,38 @@ jobs:
 
       - name: Ad-hoc Sign Binaries
         run: |
-          # 必须对 dylib 进行签名，否则 Xcode 可能会拒绝加载
+          # 即使是黑苹果，签名也能减少很多权限弹窗问题
           find OLLVM.xctoolchain/usr -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --deep -s - {} \;
 
       - name: Compress
         run: |
-          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-xcode-final.tar.xz
+          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-intel-xcode.tar.xz
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-final-${{ github.run_number }}
-          name: OLLVM Xcode Toolchain (Perfect Build)
+          tag_name: ollvm-intel-${{ github.run_number }}
+          name: OLLVM for Intel/Hackintosh (x86_64)
           body: |
-            **OLLVM Xcode Toolchain (Arm64 Native)**
+            **OLLVM Xcode Toolchain (Intel x86_64)**
             
-            **Verification:**
-            - Contains `libclang.dylib` -> Fixes "Explicit modules" error.
-            - Plugins Disabled -> Fixes linker `runOnNewStackImpl` error.
-            - Ad-hoc Signed -> Ready for M1/M2/M3.
+            Optimized for Intel Macs and Hackintosh.
             
-            **Install:**
-            1. `tar -xf ollvm-xcode-final.tar.xz`
-            2. `mv OLLVM.xctoolchain ~/Library/Developer/Toolchains/`
-            3. `xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain` (必须执行!)
+            **Features:**
+            - **Architecture**: Native `x86_64` (Runs perfectly on Intel CPUs).
+            - **Xcode Ready**: Includes `libclang.dylib` to support Xcode "Explicit Modules".
+            - **Stable**: Plugins disabled to prevent linker errors.
+            
+            **Installation:**
+            1. Download `ollvm-intel-xcode.tar.xz`.
+            2. Extract and move `OLLVM.xctoolchain` to `~/Library/Developer/Toolchains/`.
+            3. **Gatekeeper Fix**:
+               ```bash
+               xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain
+               ```
+            4. Select "OLLVM 21.0 (Intel)" in Xcode.
           files: |
-            ollvm-xcode-final.tar.xz
+            ollvm-intel-xcode.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
