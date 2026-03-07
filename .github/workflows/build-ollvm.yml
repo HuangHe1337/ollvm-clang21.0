@@ -1,38 +1,17 @@
-name: Build OLLVM (DYLIB + Wrapper) - The Final Fix
+name: Build OLLVM (Intel/Hackintosh Ultimate)
 
 on:
   workflow_dispatch:
-    inputs:
-      ndk_version:
-        description: "Android NDK Version"
-        default: 'r27c'
-        required: true
 
 permissions:
   contents: write
 
 jobs:
   build:
-    name: Build Clang (DYLIB+Wrapper)
-    runs-on: ubuntu-24.04
+    name: Build Intel Toolchain (Patched)
+    runs-on: macos-latest
     
     steps:
-      - name: Free Disk Space
-        run: |
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /opt/ghc
-          sudo docker image prune --all --force
-
-      - name: Setup Swap (16GB)
-        run: |
-          sudo swapoff -a || true
-          sudo rm -f /swapfile
-          sudo fallocate -l 16G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
-
       - name: Checkout Source
         uses: actions/checkout@v4
         with:
@@ -41,125 +20,143 @@ jobs:
           path: llvm-project
           fetch-depth: 1
 
-      - name: Install Dependencies
+      - name: Install Build Tools
         run: |
-          sudo apt-get update
-          sudo apt-get install -y ninja-build cmake build-essential xz-utils
-
-      - name: Setup NDK
+          brew install ninja cmake
+          
+      - name: Patch Clang Source (Magic Fix)
         run: |
-          curl -sSfL -o android-ndk.zip "https://dl.google.com/android/repository/android-ndk-${{ inputs.ndk_version }}-linux.zip"
-          unzip -qq android-ndk.zip
-          NDK_ROOT=$(pwd)/android-ndk-${{ inputs.ndk_version }}
-          echo "NDK_ROOT=$NDK_ROOT" >> $GITHUB_ENV
+          # ！！！核心魔法步骤！！！
+          # 修改 Clang 的参数定义文件，强行添加 Apple 私有参数 '-index-store-path'
+          # 这样 Xcode 传参时，Clang 就不会报 "unknown argument" 错误了
+          
+          OPTIONS_FILE="llvm-project/clang/include/clang/Driver/Options.td"
+          
+          echo "" >> "$OPTIONS_FILE"
+          echo "// === PATCH FOR XCODE SUPPORT ===" >> "$OPTIONS_FILE"
+          echo 'def index_store_path : Separate<["-"], "index-store-path">, Flags<[HelpHidden]>;' >> "$OPTIONS_FILE"
+          
+          echo "Patch applied to $OPTIONS_FILE. Tail content:"
+          tail -n 5 "$OPTIONS_FILE"
 
-      - name: Configure CMake (DYLIB Mode)
+      - name: Configure CMake (Cross-Compile Intel Static)
         run: |
           mkdir -p build
           
-          # === 策略说明 ===
-          # 1. 开启 DYLIB: 生成 libLLVM.so 和 libclang-cpp.so。这包含了所有符号，绝不会报 symbol missing。
-          # 2. 静态 STL: 避免依赖 libc++_shared.so。
-          # 3. 插件支持: 开启 RTTI 和 Plugin 支持。
+          TOOLCHAIN_NAME="OLLVM"
+          INSTALL_DIR="$(pwd)/${TOOLCHAIN_NAME}.xctoolchain/usr"
+          echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
+          
+          # === 配置说明 ===
+          # 1. CMAKE_OSX_ARCHITECTURES="x86_64" : 强制生成 Intel 程序
+          # 2. CMAKE_OSX_DEPLOYMENT_TARGET=13.0 : 兼容 macOS Ventura (13) 及以上
+          # 3. 静态化 (解决崩溃):
+          #    CLANG_LINK_CLANG_DYLIB=OFF : 让 clang 独立运行，不依赖 dylib
+          #    BUILD_SHARED_LIBS=OFF      : 全局静态
+          # 4. Xcode 兼容:
+          #    LLVM_BUILD_LLVM_DYLIB=ON   : 生成 libclang.dylib 喂给 Xcode (虽然 clang 不用它)
           
           cmake -G Ninja -S llvm-project/llvm -B build \
-            -DCMAKE_TOOLCHAIN_FILE=${{ env.NDK_ROOT }}/build/cmake/android.toolchain.cmake \
-            -DANDROID_ABI=arm64-v8a \
-            -DANDROID_PLATFORM=android-29 \
-            -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_ARCHITECTURES="x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
-            -DLLVM_TARGETS_TO_BUILD="AArch64" \
+            \
+            -DLLVM_TARGETS_TO_BUILD="X86;AArch64" \
             -DLLVM_ENABLE_PROJECTS="clang;lld" \
+            \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DLLVM_BUILD_LLVM_DYLIB=ON \
+            -DLLVM_LINK_LLVM_DYLIB=OFF \
+            -DCLANG_LINK_CLANG_DYLIB=OFF \
+            \
+            -DLLVM_ENABLE_PLUGINS=OFF \
+            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
+            \
             -DLLVM_BUILD_TOOLS=OFF \
             -DLLVM_INCLUDE_UTILS=OFF \
             -DLLVM_INCLUDE_BENCHMARKS=OFF \
             -DLLVM_INCLUDE_TESTS=OFF \
             -DLLVM_INCLUDE_EXAMPLES=OFF \
+            \
             -DLLVM_ENABLE_LTO=OFF \
-            \
-            -DLLVM_BUILD_LLVM_DYLIB=ON \
-            -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DCLANG_LINK_CLANG_DYLIB=ON \
-            -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
+            -DLLVM_ENABLE_ZSTD=OFF \
+            -DLLVM_ENABLE_LIBXML2=OFF \
+            -DLLVM_ENABLE_TERMINFO=OFF \
             -DLLVM_ENABLE_RTTI=ON \
-            -DLLVM_PARALLEL_LINK_JOBS=1 \
-            -DLLVM_STATIC_LINK_CXX_STDLIB=ON \
-            -DLLVM_ENABLE_PLUGINS=ON \
-            -DCMAKE_INSTALL_DO_STRIP=OFF \
             \
-            -DCMAKE_INSTALL_PREFIX=$(pwd)/install_output
+            -DCMAKE_INSTALL_DO_STRIP=ON \
+            -DCMAKE_INSTALL_PREFIX="${INSTALL_DIR}"
 
       - name: Build & Install
         run: |
-          cmake --build build --target install -j$(nproc)
+          # 同时安装 clang (静态) 和 libclang (动态库文件)
+          cmake --build build --target install-clang install-lld install-libclang install-clang-resource-headers
 
-      - name: Create Wrapper Scripts
+      - name: Setup Toolchain Structure
         run: |
-          cd install_output/bin
+          cd OLLVM.xctoolchain
           
-          # === 创建启动脚本 ===
-          # 既然 RPATH 在某些环境下不稳定，我们直接生成一个 wrapper 脚本。
-          # 这个脚本会自动把 ../lib 目录加入 LD_LIBRARY_PATH，确保 100% 能找到库。
-          
-          # 重命名原文件
-          mv clang clang.real
-          mv clang++ clang++.real
-          
-          # 创建 clang 脚本
-          cat <<EOF > clang
-          #!/bin/sh
-          # 获取脚本所在目录的上一级目录下的 lib
-          DIR=\$(cd "\$(dirname "\$0")"; pwd)
-          ROOT_DIR=\$(dirname "\$DIR")
-          export LD_LIBRARY_PATH="\$ROOT_DIR/lib:\$ROOT_DIR/lib64:\$LD_LIBRARY_PATH"
-          exec "\$DIR/clang.real" "\$@"
+          cat > Info.plist <<EOF
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+              <key>CFBundleIdentifier</key>
+              <string>org.ollvm.toolchain</string>
+              <key>CompatibilityVersion</key>
+              <integer>2</integer>
+              <key>CompatibilityVersionDisplayString</key>
+              <string>2.0</string>
+              <key>CFBundleDisplayName</key>
+              <string>OLLVM 21.0 (Intel Patched)</string>
+              <key>CFBundleVersion</key>
+              <string>21.0.0</string>
+              <key>CFBundleShortVersionString</key>
+              <string>21.0.0</string>
+          </dict>
+          </plist>
           EOF
           
-          # 创建 clang++ 脚本
-          cat <<EOF > clang++
-          #!/bin/sh
-          DIR=\$(cd "\$(dirname "\$0")"; pwd)
-          ROOT_DIR=\$(dirname "\$DIR")
-          export LD_LIBRARY_PATH="\$ROOT_DIR/lib:\$ROOT_DIR/lib64:\$LD_LIBRARY_PATH"
-          exec "\$DIR/clang++.real" "\$@"
-          EOF
+          cd usr
+          rm -rf lib/*.a lib/cmake include share libexec
           
-          chmod +x clang clang++
-          
-          echo "Wrapper scripts created."
+          # 验证
+          echo "=== Final Verification ==="
+          echo "[Arch Check] bin/clang:"
+          file bin/clang
+          echo "[Dylib Check] lib/libclang.dylib:"
+          ls -lh lib/libclang.dylib
 
-      - name: Cleanup Artifacts
+      - name: Ad-hoc Sign
         run: |
-          cd install_output
-          rm -rf lib/*.a 
-          echo "Final Size:"
-          du -sh .
+          find OLLVM.xctoolchain/usr -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --deep -s - {} \;
 
-      - name: Compress and Split
+      - name: Compress
         run: |
-          tar -cf - -C install_output . | xz -9e -T0 | split -b 400M - "ollvm-wrapper.tar.xz."
-          ls -lh ollvm-wrapper.tar.xz.*
+          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-hackintosh-final.tar.xz
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-wrapper-${{ github.run_number }}
-          name: "OLLVM (DYLIB + Wrapper) Build ${{ github.run_number }}"
+          tag_name: ollvm-intel-final-${{ github.run_number }}
+          name: OLLVM Intel Final (Patched Source)
           body: |
-            Build of OLLVM for Android (AArch64) with **Wrapper Scripts**.
+            **OLLVM Toolchain for Intel Hackintosh (Source Patched)**
             
-            **Why this version?**
-            - **Fixes `symbol not found`**: Uses `libLLVM.so` / `libclang-cpp.so` which contain ALL symbols (including `noteBottomOfStack`).
-            - **Fixes `library not found`**: Includes `clang` and `clang++` wrapper scripts that auto-set `LD_LIBRARY_PATH`.
+            **Major Fixes:**
+            1. **Fixed `unknown argument: -index-store-path`**: Patched `Options.td` source code to accept Apple's private Xcode arguments.
+            2. **Fixed `dyld` Crash**: `clang` is fully static linked (no external dylib dependencies).
+            3. **Fixed Cross-Compile**: Built on macOS-latest but targeting Intel x86_64.
             
             **Installation:**
-            1. Extract to a folder.
-            2. Copy `bin/` and `lib/` to your NDK or Termux location.
-            3. **Use `bin/clang` directly**. It is a script that sets up the environment and calls `bin/clang.real`.
+            1. Extract to `~/Library/Developer/Toolchains/`.
+            2. Run `xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain`.
+            3. Restart Xcode.
+            4. **Note**: If you still see "Explicit modules" warnings, ignore them. The build will succeed because the compiler errors are fixed.
           files: |
-            ollvm-wrapper.tar.xz.*
+            ollvm-hackintosh-final.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
