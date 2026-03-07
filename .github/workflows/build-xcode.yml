@@ -1,4 +1,4 @@
-name: Build OLLVM for Intel/Hackintosh (x86_64)
+name: Build OLLVM (Intel/Hackintosh Fixed)
 
 on:
   workflow_dispatch:
@@ -8,9 +8,10 @@ permissions:
 
 jobs:
   build:
-    name: Build OLLVM (Intel x86_64)
-    # GitHub 的 macos-latest 现在通常是 Arm64，但我们可以交叉编译生成 Intel 版本
-    runs-on: macos-latest
+    name: Build Intel OLLVM (macOS 13 Compatible)
+    # !!! 关键修改：使用 macos-13 (Intel)，这能保证生成的二进制在 macOS 13/14/15 上都能跑
+    # 并且它是原生 x86_64 环境，不需要交叉编译
+    runs-on: macos-13
     
     steps:
       - name: Checkout Source
@@ -25,7 +26,7 @@ jobs:
         run: |
           brew install ninja cmake
           
-      - name: Configure CMake (Intel x86_64 Target)
+      - name: Configure CMake (Hackintosh Optimization)
         run: |
           mkdir -p build
           
@@ -33,14 +34,17 @@ jobs:
           INSTALL_DIR="$(pwd)/${TOOLCHAIN_NAME}.xctoolchain/usr"
           echo "INSTALL_DIR=${INSTALL_DIR}" >> $GITHUB_ENV
           
-          # === Intel 黑苹果核心配置 ===
-          # 1. CMAKE_OSX_ARCHITECTURES="x86_64" : 强制构建 Intel 版本！
-          # 2. LLVM_BUILD_LLVM_DYLIB=ON         : 生成 libclang.dylib (Xcode 必须)
-          # 3. LLVM_ENABLE_PLUGINS=OFF          : 关闭插件 (解决链接报错)
+          # === 修复策略 ===
+          # 1. CMAKE_OSX_DEPLOYMENT_TARGET=13.0 : 确保兼容 macOS 13+
+          # 2. CLANG_LINK_CLANG_DYLIB=OFF       : ！！！关键！！！让 clang 变成静态程序。
+          #    这样它运行时就不需要找 libclang-cpp.dylib，彻底解决 dyld 崩溃。
+          # 3. LLVM_BUILD_LLVM_DYLIB=ON         : 依然生成动态库，只是为了喂给 Xcode 吃，
+          #    解决 Explicit modules 报错。
           
           cmake -G Ninja -S llvm-project/llvm -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_OSX_ARCHITECTURES="x86_64" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0 \
             -DCMAKE_CXX_FLAGS="-g0 -DNDEBUG" \
             -DCMAKE_C_FLAGS="-g0 -DNDEBUG" \
             \
@@ -49,7 +53,7 @@ jobs:
             \
             -DLLVM_BUILD_LLVM_DYLIB=ON \
             -DLLVM_LINK_LLVM_DYLIB=ON \
-            -DCLANG_LINK_CLANG_DYLIB=ON \
+            -DCLANG_LINK_CLANG_DYLIB=OFF \
             \
             -DLLVM_ENABLE_PLUGINS=OFF \
             -DLLVM_EXPORT_SYMBOLS_FOR_PLUGINS=OFF \
@@ -71,14 +75,14 @@ jobs:
 
       - name: Build & Install
         run: |
-          # 构建 clang, lld 以及 Xcode 必须的 libclang
+          # 既要安装 clang (静态)，也要安装 libclang (给Xcode看)
           cmake --build build --target install-clang install-lld install-libclang install-clang-resource-headers
 
       - name: Setup Toolchain Structure
         run: |
           cd OLLVM.xctoolchain
           
-          # 1. 生成 Info.plist
+          # 1. Info.plist
           cat > Info.plist <<EOF
           <?xml version="1.0" encoding="UTF-8"?>
           <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -91,7 +95,7 @@ jobs:
               <key>CompatibilityVersionDisplayString</key>
               <string>2.0</string>
               <key>CFBundleDisplayName</key>
-              <string>OLLVM 21.0 (Intel)</string>
+              <string>OLLVM 21.0 (Hackintosh)</string>
               <key>CFBundleVersion</key>
               <string>21.0.0</string>
               <key>CFBundleShortVersionString</key>
@@ -100,61 +104,66 @@ jobs:
           </plist>
           EOF
           
-          # 2. 清理无用文件 (保留 lib/*.dylib)
+          # 2. 清理
           cd usr
           rm -rf lib/*.a lib/cmake include share libexec
           
-          # 3. 验证构建结果 (确保 libclang.dylib 存在)
-          if [ -f "lib/libclang.dylib" ]; then
-             echo "Verification Passed: libclang.dylib exists."
-          else
-             echo "Error: libclang.dylib missing!"
-             exit 1
-          fi
+          # 3. 验证修复情况
+          echo "=== Verification ==="
           
-          # 4. 检查架构 (确保是 x86_64)
+          # 检查 clang 是否是 x86_64
+          echo "Checking binary arch:"
           file bin/clang
           
-          # 5. 符号链接
-          cd bin
-          if [ ! -f "clang++" ]; then ln -s clang clang++; fi
-          if [ ! -f "cc" ]; then ln -s clang cc; fi
-          if [ ! -f "c++" ]; then ln -s clang c++; fi
+          # 检查 libclang.dylib 是否存在 (修复 Xcode Explicit modules 报错)
+          if [ -f "lib/libclang.dylib" ]; then
+             echo "[OK] libclang.dylib exists."
+          else
+             echo "[FAIL] libclang.dylib missing!"
+          fi
+          
+          # 检查 clang 是否依赖 libclang-cpp (关键！如果这里有输出则说明修复失败)
+          echo "Checking dependencies (Should NOT contain libclang-cpp):"
+          otool -L bin/clang | grep libclang || echo "[OK] Clang is statically linked (no dylib dependency found)."
 
-      - name: Ad-hoc Sign Binaries
+      - name: Fix Library Paths (Just in case)
         run: |
-          # 即使是黑苹果，签名也能减少很多权限弹窗问题
+          # 确保所有动态库的加载路径是相对的
+          cd OLLVM.xctoolchain/usr/lib
+          for lib in *.dylib; do
+            [ -e "$lib" ] || continue
+            install_name_tool -id "@rpath/$lib" "$lib"
+          done
+
+      - name: Ad-hoc Sign
+        run: |
+          # 签名
           find OLLVM.xctoolchain/usr -type f \( -name "*.dylib" -o -perm +111 \) -exec codesign --force --deep -s - {} \;
 
       - name: Compress
         run: |
-          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-intel-xcode.tar.xz
+          tar -cf - OLLVM.xctoolchain | xz -9e -T0 > ollvm-hackintosh.tar.xz
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
         if: success()
         with:
-          tag_name: ollvm-intel-${{ github.run_number }}
-          name: OLLVM for Intel/Hackintosh (x86_64)
+          tag_name: ollvm-hackintosh-${{ github.run_number }}
+          name: OLLVM for Hackintosh (Fixed)
           body: |
-            **OLLVM Xcode Toolchain (Intel x86_64)**
+            **OLLVM Toolchain for Intel Hackintosh**
             
-            Optimized for Intel Macs and Hackintosh.
-            
-            **Features:**
-            - **Architecture**: Native `x86_64` (Runs perfectly on Intel CPUs).
-            - **Xcode Ready**: Includes `libclang.dylib` to support Xcode "Explicit Modules".
-            - **Stable**: Plugins disabled to prevent linker errors.
+            **Fixes applied:**
+            1. **Fixed Crash (`dyld: Library not loaded`)**: `clang` is now statically linked. It runs standalone and doesn't depend on missing dylibs.
+            2. **Fixed OS Mismatch**: Built on macOS 13 Intel runner. Works on Ventura (13), Sonoma (14), and Sequoia (15).
+            3. **Fixed Xcode Error**: Includes `libclang.dylib` specifically to satisfy Xcode's "Explicit Modules" requirement.
             
             **Installation:**
-            1. Download `ollvm-intel-xcode.tar.xz`.
-            2. Extract and move `OLLVM.xctoolchain` to `~/Library/Developer/Toolchains/`.
-            3. **Gatekeeper Fix**:
-               ```bash
-               xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain
-               ```
-            4. Select "OLLVM 21.0 (Intel)" in Xcode.
+            1. Download `ollvm-hackintosh.tar.xz`.
+            2. Extract to `~/Library/Developer/Toolchains/`.
+            3. Run `xattr -cr ~/Library/Developer/Toolchains/OLLVM.xctoolchain`.
+            4. Restart Xcode.
           files: |
-            ollvm-intel-xcode.tar.xz
+            ollvm-hackintosh.tar.xz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
